@@ -21,7 +21,6 @@ import torch
 import transformers
 import utils
 from torch.utils.data import Dataset
-from deepspeed import comm as dist
 # from transformers import Trainer
 
 from tqdm import tqdm, trange
@@ -33,8 +32,6 @@ import wandb
 import time
 from transformers import OPTForCausalLM, OPTConfig, AutoTokenizer
 from flash_attn.models.opt import remap_state_dict_hf_opt
-
-from transformers.deepspeed import HfDeepSpeedConfig
 
 # os.environ["CUDA_HOME"] = "/opt/apps/cuda/11.7"
 # os.environ["LD_LIBRARY_PATH"]= os.environ["CUDA_HOME"] + '/lib64:' + os.environ["LD_LIBRARY_PATH"]
@@ -87,7 +84,7 @@ class TrainingArguments(transformers.TrainingArguments):
     cycle_max_lr: Optional[float] = field(default=1e-3)
     t_max: Optional[int] = field(default=100)
     lr_scheduler_type: Optional[str] = field(default="cosine")
-    nvme_dir: Optional[str] = field(default='/tmp')
+    cache_dir: Optional[str] = field(default='/tmp')
     load_checkpoint: Optional[bool] = field(default=True)
 
 
@@ -209,13 +206,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
-def ds_init(
-        training_args, 
-        model_args, 
-        model_conf: str='', 
-        ds_conf: str = '',
-        special_tokens_dict = None,
-        tokenizer = None,):
+def ds_init(training_args, model_args, model_conf: str='', ds_conf: str = ''):
     if os.path.exists(model_conf):
         conf = json.load(open(model_conf))
         D_MODEL = conf['D_MODEL']
@@ -264,16 +255,16 @@ def ds_init(
                 "stage": 3,
                 "offload_optimizer": {
                     "device": "nvme",
-                    "nvme_path": training_args.nvme_dir,
+                    "nvme_path": training_args.cache_dir,
                     "pin_memory": False
                 },
                 "offload_param": {
                     "device": "nvme",
-                    "nvme_path": training_args.nvme_dir,
+                    "nvme_path": training_args.cache_dir,
                     "pin_memory": True,
                     "buffer_size": 2e8,
                     "max_in_cpu": 1e8,
-                    "buffer_count": 20
+                    "buffer_count": 40
                 },
                 "overlap_comm": True,
                 "contiguous_gradients": True,
@@ -295,19 +286,13 @@ def ds_init(
     # )
     config = OPTConfig.from_pretrained(model_args.model_name_or_path)
     config.use_flash_attention = True
-    model = None
+    model = OPTForCausalLM(config)
     if training_args.load_checkpoint:
         model = OPTForCausalLM.from_pretrained(model_args.model_name_or_path)
         state_dict = model.state_dict()
+        config = model.config
         state_dict_fa = remap_state_dict_hf_opt(state_dict, config)
-        dschf = HfDeepSpeedConfig(ds_config)
-        with deepspeed.zero.Init(config_dict_or_path=ds_config):
-            model = OPTForCausalLM(config)
-            transformers.modeling_utils._load_state_dict_into_model(model, state_dict_fa, '')
-    else:
-        dschf = HfDeepSpeedConfig(ds_config)
-        with deepspeed.zero.Init(config_dict_or_path=ds_config):
-            model = OPTForCausalLM(config)
+        model.load_state_dict(state_dict_fa)
     for name, module in model.named_modules():
         module.__name__ = name
         has_child = len(list(module.named_children())) > 0
@@ -317,16 +302,11 @@ def ds_init(
             if hasattr(module, 'bias') and module.bias is not None:
                 module.bias.__name__ = name + ".bias"
     model.gradient_checkpointing_enable()
-    smart_tokenizer_and_embedding_resize(
-        special_tokens_dict=special_tokens_dict,
-        tokenizer=tokenizer,
-        model=model,
-    )
     model_engine, _, _, _=deepspeed.initialize(
         model = model,
         config = ds_config,
     )
-    return model_engine, dschf
+    return model_engine
 
 def build_trace(model_engine, x):
     loss = model_engine(input_ids=x['input_ids'][0].unsqueeze(0).cuda(), 
@@ -363,27 +343,22 @@ def train():
     if tokenizer.unk_token is None:
         special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
 
-    model_engine, dschf = ds_init(
-        training_args, 
-        model_args, 
-        model_conf='/home1/09285/zhangyq/work/virtual_batch/gpt2-800M.json',
-        special_tokens_dict = special_tokens_dict,
-        tokenizer=tokenizer
-        )
-
+    model_engine = ds_init(training_args, model_args, model_conf='/home1/09285/zhangyq/work/virtual_batch/gpt2-800M.json')
+    smart_tokenizer_and_embedding_resize(
+        special_tokens_dict=special_tokens_dict,
+        tokenizer=tokenizer,
+        model=model_engine.module,
+    )
 
     
 
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    dataset = data_module["train_dataset"]
-    train_dataset, eval_dataset = torch.utils.data.random_split(dataset, [len(dataset) - 1500, 1500])
     num_train_epochs = int(training_args.num_train_epochs)
     batch_size = training_args.per_device_train_batch_size
     vb_enabled = training_args.virtual_batch 
     vb_sub_size = training_args.sub_batch_size
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=data_module["data_collator"])
-    eval_dataloader = torch.utils.data.DataLoader(eval_dataset, batch_size=1, shuffle=False, collate_fn=data_module["data_collator"])
+    dataloader = torch.utils.data.DataLoader(data_module["train_dataset"], batch_size=batch_size, shuffle=True, collate_fn=data_module["data_collator"])
     param_coordinator = None
     if vb_enabled:
         assert batch_size % vb_sub_size == 0, "batch size must be divisible by sub_batch_size"
@@ -398,10 +373,10 @@ def train():
     trace_ready = False
 
     for epoch in range(num_train_epochs):
-        for step, batch in tqdm(enumerate(train_dataloader), total=train_dataloader.__len__()):
+        model_engine.train()
+        for step, batch in tqdm(enumerate(dataloader), total=dataloader.__len__()):
             with torch.autograd.graph.save_on_cpu():
             # if True:
-                model_engine.train()
                 if not trace_ready and vb_enabled:
                     build_trace(model_engine, batch)
                     trace_ready = True
@@ -422,15 +397,6 @@ def train():
                     loss = outputs[0]
                 model_engine.backward(loss)
                 model_engine.step()
-                if step % 5 == 0:
-                    model_engine.eval()
-                    with torch.no_grad():
-                        eval_batch = next(iter(eval_dataloader))
-                        eval_batch = {k: v.cuda() for k, v in eval_batch.items()}
-                        eval_loss = model_engine(**eval_batch)[0]
-                        print(f"epoch: {epoch}, step: {step}, eval_loss: {eval_loss.item()}")
-                        if dist.get_rank() == 0:
-                            wandb.log({"eval_loss": eval_loss.item()})
                 # wandb.log({"loss": loss.item()/(batch_size//vb_sub_size) if vb_enabled else loss.item(),
                 #             "learning_rate": lr_scheduler.get_last_lr()[0],
                 # })
